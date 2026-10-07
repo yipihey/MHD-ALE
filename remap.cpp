@@ -95,7 +95,7 @@ namespace mfem
 
         ParFiniteElementSpace *fes_new = new ParFiniteElementSpace(pmesh_new, fes->FEColl(), fes->GetVDim());
         
-        L2Projector interp(*fes, *fes_new, *ir, 1e-4, periodic, size_y, size_z);
+        L2Projector interp(*fes, *fes_new, *ir, 1e-4, periodic, size_y, size_z, size_x);
         interp.SetLimitType(L2Projector::FCT);
         interp.SetBoundPreservingType(bp_type);
 

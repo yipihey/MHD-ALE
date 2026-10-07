@@ -75,9 +75,10 @@ namespace mfem
         // bool bound_preserving = false;
         BoundPreservingType bp_type = BoundPreservingType::NONE;
         
-        // For periodic BC along y and z
-        // Assume same size in y and z direction
+        // Positive lengths enable periodic images independently in each axis.
+        // The trailing x length preserves the original y/z calling convention.
         bool periodic = false;
+        real_t size_x;
         real_t size_y; 
         real_t size_z;
 
@@ -86,7 +87,7 @@ namespace mfem
         enum LimitType{FCT};
         LimitType limit_type = FCT;
         
-        L2Projector(const ParFiniteElementSpace &src_fes, const ParFiniteElementSpace &tar_fes, const IntegrationRule &ir_,  real_t bdr_tol_ = 1e-8, bool periodic_ = false, real_t size_y_ = 1.0, real_t size_z_ = 1.0);
+        L2Projector(const ParFiniteElementSpace &src_fes, const ParFiniteElementSpace &tar_fes, const IntegrationRule &ir_,  real_t bdr_tol_ = 1e-8, bool periodic_ = false, real_t size_y_ = 1.0, real_t size_z_ = 1.0, real_t size_x_ = -1.0);
 
         ~L2Projector();
         

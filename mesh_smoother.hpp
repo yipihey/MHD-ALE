@@ -20,6 +20,8 @@ public:
     virtual ~MeshSmoother(){}
     
     virtual void Smooth(ParGridFunction &newnodes) = 0;
+
+    virtual real_t MaxDisplacement() { return 0.0; }
 };
 
 // just do nothing
@@ -42,6 +44,9 @@ class InitialSmoother: public MeshSmoother
 protected:
 
     ParGridFunction nodes;
+    Vector periodic_lengths;
+    bool comoving = false;
+    void BulkDisplacement(Vector &shift) const;
     
 public:
 
@@ -50,6 +55,10 @@ public:
     virtual ~InitialSmoother() {}
     
     void Smooth(ParGridFunction &newnodes) override;
+
+    // Translate the reference mesh only along enabled periodic directions.
+    void ConfigurePeriodic(const Vector &lengths, bool comoving_);
+    real_t MaxDisplacement() override;
 };
 
 class LimitedHarmonicSmoother: public MeshSmoother
@@ -111,10 +120,10 @@ public:
     void Smooth(ParGridFunction &newnodes) override;
     
     // Compute maximum displacement in y,z directions
-    real_t MaxDisplacement();
+    real_t MaxDisplacement() override;
 };
     
 }
 
 
-#endif // MESH_SMOOTHER_HPP 
+#endif // MESH_SMOOTHER_HPP

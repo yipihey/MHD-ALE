@@ -2,3 +2,8 @@
 .vscode
 output/
 MHD
+*.d
+test_mean_field_geometry
+test_periodic_projection
+tests/output/
+__pycache__/

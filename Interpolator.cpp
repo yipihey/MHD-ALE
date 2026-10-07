@@ -211,7 +211,7 @@ L2Projector::L2Projector(const ParFiniteElementSpace &src_,
                          real_t bdr_tol_, 
                          bool periodic_, 
                          real_t size_y_,
-                           real_t size_z_)
+                         real_t size_z_, real_t size_x_)
     : src_fes(&src_),
       tar_fes(&tar_),
       pmesh_src(*src_fes->GetParMesh()),
@@ -219,6 +219,7 @@ L2Projector::L2Projector(const ParFiniteElementSpace &src_,
       target_ir(ir_),
       target_qs(pmesh_tar, target_ir),
       periodic(periodic_),
+      size_x(size_x_),
       size_y(size_y_),
       size_z(size_z_)
 {
@@ -270,33 +271,41 @@ L2Projector::L2Projector(const ParFiniteElementSpace &src_,
    nodes_cnt = vxyz.Size() / mesh_dim;
 
    // set up finder
-   int finder_size = 1;
    std::vector<Vector> vxyz_shifts;
-   if(periodic)
-   {
-      if(mesh_dim == 2)
-      {
-         finder_size = 3;
-         vxyz_shifts.resize(3);
-         vxyz_shifts[0] = Vector({0.0, 0.0});
-         vxyz_shifts[1] = Vector({0.0, size_y});
-         vxyz_shifts[2] = Vector({0.0, -size_y});
+   Vector zero(mesh_dim); zero=0.0;
+   if(periodic) {
+      // Center periodic images on the unwrapped source mesh. This supports
+      // arbitrarily large rigid boosts; neighboring images cover deformation.
+      const auto &source_nodes=*pmesh_src.GetNodes();
+      const auto *source_space=source_nodes.FESpace();
+      const int source_count=source_space->GetNDofs();
+      double local[7]={0,0,0,0,0,0,0}, global[7];
+      for(int d=0;d<mesh_dim;d++) {
+         for(int i=0;i<source_count;i++)
+            local[d]+=source_nodes(source_space->DofToVDof(i,d));
+         for(int i=0;i<nodes_cnt;i++) local[d+3]+=vxyz(d*nodes_cnt+i);
       }
-      else if(mesh_dim == 3)
-      {
-         finder_size = 9;
-         vxyz_shifts.resize(9);
-         vxyz_shifts[0] = Vector({0.0, 0.0, 0.0});
-         vxyz_shifts[1] = Vector({0.0, 0.0, size_z});
-         vxyz_shifts[2] = Vector({0.0, 0.0, -size_z});
-         vxyz_shifts[3] = Vector({0.0, size_y, 0.0});
-         vxyz_shifts[4] = Vector({0.0, size_y, size_z});
-         vxyz_shifts[5] = Vector({0.0, size_y, -size_z});
-         vxyz_shifts[6] = Vector({0.0, -size_y, 0.0});
-         vxyz_shifts[7] = Vector({0.0, -size_y, size_z});
-         vxyz_shifts[8] = Vector({0.0, -size_y, -size_z});
+      local[6]=source_count;
+      MPI_Allreduce(local,global,7,MPI_DOUBLE,MPI_SUM,pmesh_src.GetComm());
+      double target_local=nodes_cnt,target_global;
+      MPI_Allreduce(&target_local,&target_global,1,MPI_DOUBLE,MPI_SUM,pmesh_src.GetComm());
+      const real_t lengths[3]={size_x,size_y,size_z};
+      for(int d=0;d<mesh_dim;d++) if(lengths[d]>0)
+         zero(d)=round((global[d]/global[6]-global[d+3]/target_global)/lengths[d])*lengths[d];
+   }
+   vxyz_shifts.push_back(zero);
+   if (periodic) {
+      const real_t lengths[3]={size_x,size_y,size_z};
+      for(int d=0;d<mesh_dim;d++) {
+         if(lengths[d]<=0) continue;
+         const int old_size=vxyz_shifts.size();
+         for(int i=0;i<old_size;i++) for(int sign: {1,-1}) {
+            Vector shift(vxyz_shifts[i]); shift(d)+=sign*lengths[d];
+            vxyz_shifts.push_back(shift);
+         }
       }
    }
+   int finder_size=vxyz_shifts.size();
    finders.SetSize(finder_size);
    vxyz_shifted.resize(finder_size);
    for(int f = 0; f < finder_size; f++)
@@ -305,7 +314,7 @@ L2Projector::L2Projector(const ParFiniteElementSpace &src_,
       finders[f]->SetDistanceToleranceForPointsFoundOnBoundary(bdr_tol_);
       finders[f]->Setup(pmesh_src);
       vxyz_shifted[f] = vxyz;
-      if(periodic && f > 0)
+      if(periodic)
       {
          Vector rowx(vxyz_shifted[f].GetData(), nodes_cnt);
          Vector rowy(vxyz_shifted[f].GetData() + nodes_cnt, nodes_cnt);
@@ -365,17 +374,9 @@ void L2Projector::Interpolate(const ParGridFunction &func_source, ParGridFunctio
             break;
          }
       }
-      if(val < -1e15)
-      {
-         printf("[Rank %d] L2Projector warning: point %d could not be mapped to the source mesh!\n", Mpi::WorldRank(), i);
-         printf(" val[0] = %g\n", interp_vals_vec[0](i));
-         printf(" val[1] = %g\n", interp_vals_vec[1](i));
-         printf(" val[2] = %g\n", interp_vals_vec[2](i));
-         int i_node = i % nodes_cnt;
-         printf(" f = 0: x[0] = %g, y[0] = %g\n", vxyz_shifted[0](i_node), vxyz_shifted[0](i_node + nodes_cnt));
-         printf(" f = 1: x[1] = %g, y[1] = %g\n", vxyz_shifted[1](i_node), vxyz_shifted[1](i_node + nodes_cnt));
-         printf(" f = 2: x[2] = %g, y[2] = %g\n", vxyz_shifted[2](i_node), vxyz_shifted[2](i_node + nodes_cnt));
-      }
+      MFEM_VERIFY(val > -1e15,
+                  "L2Projector: target point not found in source periodic images; "
+                  "rezone before mesh deformation exceeds the image search.");
       interp_vals_final(i) = val;
    }
 

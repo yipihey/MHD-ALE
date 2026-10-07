@@ -23,6 +23,68 @@ InitialSmoother::InitialSmoother(ParMesh &pmesh_): MeshSmoother(pmesh_)
 void InitialSmoother::Smooth(ParGridFunction &newnodes)
 {
     newnodes = nodes;
+    if (!comoving) { return; }
+    Vector shift;
+    BulkDisplacement(shift);
+    auto *space = nodes.ParFESpace();
+    for (int i = 0; i < space->GetNDofs(); ++i)
+        for (int d = 0; d < shift.Size(); ++d)
+            newnodes(space->DofToVDof(i,d)) += shift(d);
+}
+
+void InitialSmoother::ConfigurePeriodic(const Vector &lengths, bool comoving_)
+{
+    periodic_lengths = lengths;
+    comoving = comoving_;
+}
+
+void InitialSmoother::BulkDisplacement(Vector &shift) const
+{
+    const int dim = pmesh->SpaceDimension();
+    shift.SetSize(dim);
+    shift = 0.0;
+    if (!comoving) { return; }
+
+    // Count true DOFs once so shared nodes do not acquire partition weights.
+    auto *current = dynamic_cast<ParGridFunction *>(pmesh->GetNodes());
+    Vector current_true, reference_true;
+    current->GetTrueDofs(current_true);
+    nodes.GetTrueDofs(reference_true);
+    current_true -= reference_true;
+    const int count = current_true.Size()/dim;
+    const bool by_nodes = nodes.ParFESpace()->GetOrdering() == Ordering::byNODES;
+    Vector local(dim+1), global(dim+1);
+    local = 0.0;
+    for (int i = 0; i < count; ++i)
+        for (int d = 0; d < dim; ++d)
+            local(d) += current_true(by_nodes ? d*count+i : i*dim+d);
+    local(dim) = count;
+    MPI_Allreduce(local.GetData(), global.GetData(), dim+1,
+                  MPITypeMap<real_t>::mpi_type, MPI_SUM, pmesh->GetComm());
+    MFEM_VERIFY(global(dim) > 0.0, "Empty reference mesh");
+    for (int d = 0; d < dim; ++d)
+        if (periodic_lengths(d) > 0.0) { shift(d) = global(d)/global(dim); }
+}
+
+real_t InitialSmoother::MaxDisplacement()
+{
+    if (periodic_lengths.Size() == 0) { return 0.0; }
+    Vector shift;
+    BulkDisplacement(shift);
+    auto *current = dynamic_cast<ParGridFunction *>(pmesh->GetNodes());
+    auto *space = nodes.ParFESpace();
+    real_t max_disp = 0.0;
+    for (int i = 0; i < space->GetNDofs(); ++i)
+        for (int d = 0; d < shift.Size(); ++d)
+            if (periodic_lengths(d) > 0.0)
+            {
+                const int index = space->DofToVDof(i,d);
+                max_disp = std::max(max_disp,
+                    std::abs((*current)(index)-nodes(index)-shift(d)));
+            }
+    MPI_Allreduce(MPI_IN_PLACE, &max_disp, 1, MPITypeMap<real_t>::mpi_type,
+                  MPI_MAX, pmesh->GetComm());
+    return max_disp;
 }
 
 LimitedHarmonicSmoother::LimitedHarmonicSmoother(ParMesh &pmesh_, real_t epsilon_)

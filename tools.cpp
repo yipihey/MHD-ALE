@@ -462,6 +462,12 @@ namespace mfem
 
     void DivFreeProject(ParGridFunction &gf, ParFiniteElementSpace *W_space, VectorCoefficient &fcoeff)
     {
+        // A fully periodic divergence constraint has a constant null mode.
+        // Uniform harmonic fields already have an exact RT representation;
+        // retain it rather than invoking a singular mixed-system solve.
+        gf.ProjectCoefficient(fcoeff);
+        const real_t norm = sqrt(GFInnerProduct(gf,gf));
+        if(GFDivError(gf) <= 1e-11*std::max(norm,real_t(1e-30))) return;
 
         ParFiniteElementSpace *R_space = gf.ParFESpace();
         StopWatch chrono;

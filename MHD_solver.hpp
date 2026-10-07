@@ -108,6 +108,9 @@ protected:
    // ALE
    MeshSmoother *mesh_smoother;
    ParGridFunction *nodes; // pmesh->nodes
+   bool preserve_mean_field = false;
+   ParGridFunction mean_field_reference_nodes;
+   Vector uniform_background;
    MeshSmoothType mesh_smooth_type;
    real_t mesh_smooth_eps;
    bool fix_step_remesh;
@@ -190,6 +193,8 @@ public:
    void ComputeMeshQuality(real_t &min_detJ, real_t &max_detJ, real_t &singular_ratio) const;
    bool NeedRemesh();
    void RemeshAndRemap(Vector &S);
+   void SetPreserveMeanField(bool enabled);
+   void SetComovingRezone(bool enabled);
    void SetRemeshParameters(real_t min_detJ_, real_t max_detJ_, real_t max_ratio_, real_t max_disp_)
    { min_detJ = min_detJ_; max_detJ = max_detJ_; max_ratio = max_ratio_; max_disp = max_disp_; }
    void SetRemapType_v(RemapType rt){ remap_type_v = rt; }

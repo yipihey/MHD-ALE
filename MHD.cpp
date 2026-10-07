@@ -162,6 +162,14 @@ int main(int argc, char *argv[])
    const char *paraview_basename = "MHD";
    
    bool ale = true;
+   bool preserve_mean_field = false;
+   bool comoving_rezone = false;
+   bool magnetic_audit_enabled = false;
+   bool shear_periodic_x = false;
+   real_t shear_boost_x = 0.0;
+   const char *box_ic_file = "box.ic";
+   real_t shear_boost = 0.0;
+   real_t shear_amplitude = 1.0;
    MeshSmoothType mesh_smooth_type = MeshSmoothType::LIMITED_HARMONIC;
    real_t smooth_eps = 1e-4;
    bool debug = false;
@@ -231,6 +239,24 @@ int main(int argc, char *argv[])
                   "Directory to save the output files.");
    args.AddOption(&paraview_basename, "-pvb", "--paraview-basename",
                   "Base name for the ParaView output files.");
+   args.AddOption(&preserve_mean_field, "-pmf", "--preserve-mean-field",
+                  "-no-pmf", "--no-preserve-mean-field",
+                  "Retain transported uniform periodic background flux through remap.");
+   args.AddOption(&comoving_rezone, "-crz", "--comoving-rezone",
+                  "-no-crz", "--no-comoving-rezone",
+                  "Retain bulk translation in periodic initial-mesh rezoning.");
+   args.AddOption(&magnetic_audit_enabled, "-ma", "--magnetic-audit",
+                  "-no-ma", "--no-magnetic-audit",
+                  "Record native magnetic energy and mean flux around remaps.");
+   args.AddOption(&shear_periodic_x, "-spx", "--shear-periodic-x",
+                  "-no-spx", "--no-shear-periodic-x",
+                  "Make the shear regression periodic in x as well as y/z.");
+   args.AddOption(&shear_boost_x, "-sbx", "--shear-boost-x",
+                  "Uniform x boost for the fully periodic shear regression.");
+   args.AddOption(&box_ic_file, "-bic", "--box-ic",
+                  "Fourier initial-condition file for the periodic box (problem 15).");
+   args.AddOption(&shear_amplitude, "-samp", "--shear-amplitude", "Shear amplitude; zero gives a pure translation control.");
+   args.AddOption(&shear_boost, "-sboost", "--shear-boost", "Uniform y boost for the shear audit.");
    args.AddOption(&ale, "-ale", "--ale", "-no-ale", "--no-ale",
                   "Enable ALE (Arbitrary Lagrangian-Eulerian) mesh motion.");
    args.AddOption((int*)&mesh_smooth_type, "-mst", "--mesh-smooth-type",
@@ -303,6 +329,9 @@ int main(int argc, char *argv[])
       MPI_Barrier(MPI_COMM_WORLD);
    }
    
+   SetPeriodicShearParameters(shear_amplitude, shear_boost, shear_boost_x,
+                              shear_periodic_x);
+   if (problem == PERIODIC_BOX) { SetPeriodicBoxIC(box_ic_file); }
    ProblemData *pd = GetProblemData(problem, dim, Bmag);
    GetPlotTime(plot_time_file, plot_time);
 
@@ -360,10 +389,14 @@ int main(int argc, char *argv[])
    int A_dim = dim==2 ? 1 : 3;
    if(pd->periodic)
    {
-      if(ale && mesh_smooth_type != MeshSmoothType::PERIODIC)
+      if(ale && mesh_smooth_type != MeshSmoothType::PERIODIC &&
+         mesh_smooth_type != MeshSmoothType::INITIAL)
       {
-         MFEM_ABORT("For periodic mesh, only periodic mesh smoother is allowed in ALE!");
+         MFEM_ABORT("Periodic ALE requires the initial (-mst 1) or periodic (-mst 3) mesh smoother.");
       }
+      MFEM_VERIFY(!ale || pd->px_length <= 0.0 ||
+                  mesh_smooth_type == MeshSmoothType::INITIAL,
+                  "The periodic smoother assumes x walls; use -mst 1 when x is periodic.");
    }
 
    // Parallel partitioning of the mesh.
@@ -558,6 +591,8 @@ int main(int argc, char *argv[])
                            
    hydro.SetRemeshParameters(min_detJ, max_detJ, max_ratio, max_displacement);
    
+   hydro.SetPreserveMeanField(preserve_mean_field);
+   hydro.SetComovingRezone(comoving_rezone);
    hydro.SetRemapType_v(remap_type_v);
    hydro.SetRemapType_e(remap_type_e);
    hydro.SetRemapType_A(remap_type_A);
@@ -592,7 +627,8 @@ int main(int argc, char *argv[])
    // output divergence error of B
    char B_div_err_file[filename_length];
    sprintf(B_div_err_file, "%s/B_divergence_error.dat", outputdir);
-   std::ofstream B_div_err_out(B_div_err_file);
+   std::ofstream B_div_err_out;
+   if (Mpi::Root()) { B_div_err_out.open(B_div_err_file); }
    real_t B_err = GFDivError(B_gf);
    B_div_err_out << std::scientific << std::setprecision(16)
                      << t << " " << B_err << endl;
@@ -600,7 +636,8 @@ int main(int argc, char *argv[])
    // output minimum value of rho
    char rho_min_file[filename_length];
    sprintf(rho_min_file, "%s/rho_min.dat", outputdir);
-   std::ofstream rho_min_out(rho_min_file);
+   std::ofstream rho_min_out;
+   if (Mpi::Root()) { rho_min_out.open(rho_min_file); }
    real_t rho_min, rho_max; 
    GFMinMax(rho_gf, rho_min, rho_max);
    rho_min_out << std::scientific << std::setprecision(16)
@@ -609,7 +646,8 @@ int main(int argc, char *argv[])
    // output helicity 
    char helicity_file[filename_length];
    sprintf(helicity_file, "%s/helicity.dat", outputdir);
-   std::ofstream helicity_out(helicity_file);
+   std::ofstream helicity_out;
+   if (Mpi::Root()) { helicity_out.open(helicity_file); }
    real_t helicity = 0.0;
    if(dim == 3) helicity = GFInnerProduct(B_gf, A_gf);
    helicity_out << std::scientific << std::setprecision(16)
@@ -618,16 +656,57 @@ int main(int argc, char *argv[])
    // output time step
    char time_step_file[filename_length];
    sprintf(time_step_file, "%s/time_step.dat", outputdir);
-   std::ofstream time_step_out(time_step_file);
+   std::ofstream time_step_out;
+   if (Mpi::Root()) { time_step_out.open(time_step_file); }
    
    // output ALE
    char ale_file[filename_length];
    sprintf(ale_file, "%s/ale.dat", outputdir);
-   std::ofstream ale_out(ale_file);
+   std::ofstream ale_out;
+   if (Mpi::Root()) { ale_out.open(ale_file); }
    
+   // Integrated diagnostics execute collectively; only root opens the file.
+   std::ofstream magnetic_audit;
+   if (magnetic_audit_enabled && Mpi::Root())
+   {
+      magnetic_audit.open(std::string(outputdir) + "/magnetic_audit.csv");
+      magnetic_audit << "time,phase,magnetic_energy,total_energy,mean_Bx,mean_By,mean_Bz\n";
+   }
+   auto audit_magnetic = [&](real_t audit_time, const char *phase)
+   {
+      if (!magnetic_audit_enabled) { return; }
+      real_t eb = GFInnerProduct(B_gf, B_gf)/(2.0*pd->mu);
+      real_t et = eb + hydro.InternalEnergy(e_gf) + hydro.KineticEnergy(v_gf);
+      Vector local_mean(3), global_mean(3), field(dim);
+      local_mean = 0.0;
+      real_t local_volume = 0.0, global_volume;
+      for (int e = 0; e < pmesh->GetNE(); ++e)
+      {
+         auto *T = pmesh->GetElementTransformation(e);
+         const auto &quad = hydro.GetIntegrationRule();
+         for (int q = 0; q < quad.GetNPoints(); ++q)
+         {
+            const auto &ip = quad.IntPoint(q);
+            T->SetIntPoint(&ip);
+            B_gf.GetVectorValue(*T, ip, field);
+            real_t weight = ip.weight*T->Weight();
+            local_volume += weight;
+            for (int d = 0; d < dim; ++d) { local_mean(d) += weight*field(d); }
+         }
+      }
+      MPI_Allreduce(local_mean.GetData(), global_mean.GetData(), 3, MPI_DOUBLE, MPI_SUM, pmesh->GetComm());
+      MPI_Allreduce(&local_volume, &global_volume, 1, MPI_DOUBLE, MPI_SUM, pmesh->GetComm());
+      global_mean /= global_volume;
+      if (Mpi::Root())
+      {
+         magnetic_audit << std::scientific << std::setprecision(16)
+                        << audit_time << "," << phase << "," << eb << "," << et
+                        << "," << global_mean(0) << "," << global_mean(1) << "," << global_mean(2) << std::endl;
+      }
+   };
+   audit_magnetic(t, "initial");
    PrintError(pd, t, rho_gf, v_gf, e_gf, B_gf);
-     
-     
+
    for (int ti = 1; !last_step; ti++)
    {
       if (t + dt >= t_final)
@@ -708,7 +787,9 @@ int main(int argc, char *argv[])
                              outputdir, paraview_basename);
                if(last_step) ti++;
             }
+            audit_magnetic(t, "pre_remap");
             hydro.RemeshAndRemap(S);
+            audit_magnetic(t, "post_remap");
             if(plot_at_remap && (visualization || paraview))
             {
                Visualization(visualization, paraview, pmesh, rho_gf, v_gf, e_gf, B_gf, A_gf, ++ti, t+100,
@@ -720,6 +801,7 @@ int main(int argc, char *argv[])
       ale_out << std::scientific << std::setprecision(16)
                 << t << " " << need_remesh << endl;
       
+      audit_magnetic(t, "accepted_step");
       // output divergence error of B
       B_err = GFDivError(B_gf);
       B_div_err_out << std::scientific << std::setprecision(16)

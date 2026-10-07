@@ -7,6 +7,10 @@ ProblemData *GetProblemData(Testcase p, int dim, real_t Bmag)
 {
    switch (p)
    {
+   case PERIODIC_SHEAR:
+      return GetProblemPeriodicShear(dim);
+   case PERIODIC_BOX:
+      return GetProblemPeriodicBox(dim);
    case TAYLOR_GREEN:
       return GetProblemTaylorGreen(dim);
       break;

@@ -23,6 +23,7 @@
 #include "mesh_smoother.hpp"
 #include "Interpolator.hpp"
 #include "remap.hpp"
+#include "mean_field.hpp"
 #include "tools.hpp"
 
 #ifdef MFEM_USE_MPI
@@ -738,11 +739,9 @@ bool LagrangianHydroOperator::NeedRemesh()
 {
    static int false_time = 0;
    
-   PeriodicSmoother *ps = dynamic_cast<PeriodicSmoother *>(mesh_smoother);
-   real_t disp = 0.0;
-   if(ps)
+   real_t disp = mesh_smoother->MaxDisplacement();
+   if(pd->periodic)
    {
-      disp = ps->MaxDisplacement();
       if(Mpi::Root())
       {
          printf("periodic displacement: %g \n", disp);
@@ -753,7 +752,7 @@ bool LagrangianHydroOperator::NeedRemesh()
    ComputeMeshQuality(min, max, ratio);
    bool need_remesh = false;
    need_remesh = (ratio > max_ratio) || (min<min_detJ) || (max>max_detJ) || (fix_step_remesh && false_time>=fix_step_remesh_interval-1) 
-   || (ps && (disp > max_disp))
+   || (pd->periodic && (disp > max_disp))
    ;
    if(!need_remesh)
    {
@@ -774,6 +773,54 @@ bool LagrangianHydroOperator::NeedRemesh()
    
    return need_remesh;
    
+}
+
+void LagrangianHydroOperator::SetComovingRezone(bool enabled)
+{
+   auto *initial = dynamic_cast<InitialSmoother *>(mesh_smoother);
+   MFEM_VERIFY(!enabled || (initial && pd->periodic),
+               "Comoving rezoning requires a periodic problem and initial-mesh smoother (-mst 1)");
+   if (initial && pd->periodic)
+   {
+      Vector lengths(dim);
+      lengths(0) = pd->px_length;
+      lengths(1) = pd->py_length;
+      if (dim == 3) { lengths(2) = pd->pz_length; }
+      initial->ConfigurePeriodic(lengths, enabled);
+   }
+}
+
+void LagrangianHydroOperator::SetPreserveMeanField(bool enabled)
+{
+   preserve_mean_field = enabled && pd->periodic;
+   if (!preserve_mean_field) { return; }
+   MFEM_VERIFY(pd->B0_periodic, "Periodic background coefficient is required");
+   int required_order = dim == 2 ? order_v : 2*order_v;
+   MFEM_VERIFY(order_A >= required_order,
+               "Mean-field correction requires A order >= mesh order in 2D, "
+               "or >= twice mesh order in 3D");
+   mean_field_reference_nodes.SetSpace(&fes_x);
+   mean_field_reference_nodes = *nodes;
+   uniform_background.SetSize(dim);
+   ElementTransformation *first = pmesh->GetElementTransformation(0);
+   pd->B0_periodic->Eval(uniform_background, *first, ir.IntPoint(0));
+   // Every rank must check against the same value, including a background that
+   // happens to be constant within each partition but differs across partitions.
+   MPI_Bcast(uniform_background.GetData(), dim, MPI_DOUBLE, 0, pmesh->GetComm());
+   real_t local_error = 0.0;
+   Vector sample(dim);
+   for (int e = 0; e < NE; ++e)
+      for (int q = 0; q < ir.GetNPoints(); ++q)
+      {
+         auto *T = pmesh->GetElementTransformation(e);
+         pd->B0_periodic->Eval(sample, *T, ir.IntPoint(q));
+         sample -= uniform_background;
+         local_error = std::max(local_error, sample.Norml2());
+      }
+   real_t global_error;
+   MPI_Allreduce(&local_error, &global_error, 1, MPI_DOUBLE, MPI_MAX, pmesh->GetComm());
+   MFEM_VERIFY(global_error <= 1e-12*std::max(uniform_background.Norml2(),1e-30),
+               "Mean-field correction supports spatially uniform backgrounds only");
 }
 
 void LagrangianHydroOperator::RemeshAndRemap(Vector &S)
@@ -802,6 +849,25 @@ void LagrangianHydroOperator::RemeshAndRemap(Vector &S)
    GFMinMax(e_gf, e_min, e_max, &ir);
    GFMinMax(rho_gf, rho_min, rho_max, &ir);
 
+   if (preserve_mean_field)
+   {
+      AddUniformMeanFieldPotential(A_gf, mean_field_reference_nodes,
+                                   *nodes, uniform_background);
+      // Verify the decomposition BEFORE applying any remap or moving the mesh.
+      ParGridFunction reconstructed(&fes_B), background(&fes_B);
+      ComputeCurl(A_gf, reconstructed);
+      background = 0.0;
+      DivFreeProject(background, &fes_divB, *pd->B0_periodic);
+      reconstructed += background;
+      reconstructed -= B_gf;
+      real_t relative_error = sqrt(GFInnerProduct(reconstructed,reconstructed) /
+                                    std::max(GFInnerProduct(B_gf,B_gf),1e-300));
+      if (Mpi::Root())
+         printf("Mean-field decomposition relative L2 error: %.16e\n", relative_error);
+      MFEM_VERIFY(relative_error < 1e-8,
+                  "Mean-field potential decomposition failed its native flux check");
+   }
+
    // Remap rho
    if(Mpi::Root())
    {
@@ -815,7 +881,7 @@ void LagrangianHydroOperator::RemeshAndRemap(Vector &S)
       L2ProjectRemap l2_remap_rho;
       l2_remap_rho.SetIntegrationRule(ir);
       l2_remap_rho.SetBoundPreservingType(bp_type);
-      l2_remap_rho.SetPeriodic(pd->periodic, pd->py_length, pd->pz_length);
+      l2_remap_rho.SetPeriodic(pd->periodic, pd->py_length, pd->pz_length, pd->px_length);
       l2_remap_rho.Remap(mesh_velocity, rho_gf);
       
       break;
@@ -984,6 +1050,8 @@ void LagrangianHydroOperator::RemeshAndRemap(Vector &S)
       B_gf += B0_gf;
    }
    
+   if (preserve_mean_field) { mean_field_reference_nodes = *nodes; }
+
    // restart Lagrangian 
    AssembleMvMe();
          

@@ -20,7 +20,9 @@ typedef enum Testcase_
    STATIC3D = 8,
    SuperFast = 11,
    MHDshocktube3 = 12,
-    MHDshocktube4 = 13
+    MHDshocktube4 = 13,
+   PERIODIC_SHEAR = 14,
+   PERIODIC_BOX = 15
 } Testcase;
 
 class ProblemData
@@ -216,6 +218,11 @@ public:
 };
 
 ProblemData *GetProblemTaylorGreen(int dim);
+ProblemData *GetProblemPeriodicShear(int dim);
+void SetPeriodicShearParameters(real_t amplitude, real_t boost_y,
+                               real_t boost_x, bool periodic_x);
+ProblemData *GetProblemPeriodicBox(int dim);
+void SetPeriodicBoxIC(const char *path);
 ProblemData *GetProblemMHDrotor();
 ProblemData *GetProblemMHDblast(real_t Bmag_);
 ProblemData *GetProblemBrioWushocktube(int dim);

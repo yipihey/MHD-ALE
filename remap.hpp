@@ -70,16 +70,18 @@ namespace mfem
       const IntegrationRule *ir = nullptr;
       
       bool periodic = false;
+      real_t size_x;
       real_t size_y;
       real_t size_z;
    public:
-      L2ProjectRemap() : size_y(1.0), size_z(1.0) {}
+      L2ProjectRemap() : size_x(-1.0), size_y(1.0), size_z(1.0) {}
       
       void SetBoundPreservingType(BoundPreservingType bp){bp_type = bp;};
       
-      void SetPeriodic(bool periodic_, real_t size_y_, real_t size_z_)
+      void SetPeriodic(bool periodic_, real_t size_y_, real_t size_z_, real_t size_x_ = -1.0)
       {
          periodic = periodic_;
+         size_x = size_x_;
          size_y = size_y_;
          size_z = size_z_;
       }

@@ -1,0 +1,11 @@
+{
+  "upstream_commit": "0e0564ed92acff6ad84d3f86f6609bb7ad916ce8",
+  "configuration": "Distributed Taylor-Green script, refinement 0, t=0.5; visualization disabled",
+  "final_L2_errors": {
+    "rho": 0.0247495347457452,
+    "v": 0.0136651108316442,
+    "e": 0.0366129714894787,
+    "B": 0.0250850745003075
+  },
+  "absolute_tolerance": 0.000001
+}
