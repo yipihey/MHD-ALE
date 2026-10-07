@@ -77,6 +77,35 @@ void LorentzForceIntegrator::AssembleRHSElementVect(const FiniteElement &el,
    }
 }
 
+void QuadratureForceLFIntegrator::AssembleRHSElementVect(
+   const FiniteElement &el, ElementTransformation &Tr, Vector &elvect)
+{
+   MFEM_VERIFY(IntRule, "Integration rule not set in QuadratureForceLFIntegrator");
+   const int e = Tr.ElementNo;
+   const int nqp = IntRule->GetNPoints();
+   const int dim = el.GetDim();
+   const int dof = el.GetDof();
+   dshape.SetSize(dof, dim);
+   elvect.SetSize(dof*dim);
+   elvect = 0.0;
+   for (int q = 0; q < nqp; q++)
+   {
+      const IntegrationPoint &ip = IntRule->IntPoint(q);
+      el.CalcDShape(ip, dshape);
+      const int eq = e*nqp + q;
+      for (int vd = 0; vd < dim; vd++)
+      {
+         const DenseMatrix &T = JinvT(vd);
+         for (int i = 0; i < dof; i++)
+         {
+            real_t f = 0.0;
+            for (int gd = 0; gd < dim; gd++) { f += T(eq, gd) * dshape(i, gd); }
+            elvect(i + vd*dof) += f;
+         }
+      }
+   }
+}
+
 void ForceIntegrator::AssembleElementMatrix2(const FiniteElement &trial_fe,
                                              const FiniteElement &test_fe,
                                              ElementTransformation &Tr,

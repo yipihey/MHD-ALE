@@ -1,6 +1,7 @@
 #include "remap.hpp"
 #include "tools.hpp"
 #include "Integrators.hpp"
+#include <algorithm>
 
 namespace mfem
 {
@@ -171,7 +172,7 @@ namespace mfem
         real_t tau = 0.0;
         real_t tau_final = 1.0;
         real_t max_velocity = GFMaxNorm(mesh_velocity);
-        real_t dt = 0.1*GetMeshSize(pmesh) / max_velocity / mesh_order;
+        real_t dt = pseudo_cfl*GetMeshSize(pmesh) / max_velocity / mesh_order;
         int n_steps = ceil(tau_final/dt);
         dt = tau_final/n_steps;
         
@@ -333,26 +334,26 @@ namespace mfem
         H_mass_bf.RecoverFEMSolution(X, H_lf, H_gf);
     }
 
-    DG_Evolution::DG_Evolution(ParBilinearForm &M_, ParBilinearForm &K_, ParLinearForm &b_, ParGridFunction *nodes_, ParGridFunction *mesh_velocity_, int vdim_)
-        : TimeDependentOperator(nodes_->ParFESpace()->TrueVSize() + M_.ParFESpace()->GetTrueVSize()*vdim_), 
-          M_bf(&M_),
+    DG_Evolution::DG_Evolution(ParBilinearForm &K_, ParGridFunction *nodes_,
+                               ParGridFunction *mesh_velocity_, int vdim_,
+                               const IntegrationRule *mass_ir_)
+        : TimeDependentOperator(nodes_->ParFESpace()->TrueVSize() + K_.ParFESpace()->GetTrueVSize()*vdim_),
           K_bf(&K_),
-          b_lf(&b_),
-          pmesh(M_.ParFESpace()->GetParMesh()),
-        nodes(nodes_), 
-        mesh_fes(nodes->ParFESpace()),
-            mesh_velocity(mesh_velocity_),
-            M_prec(new HypreDiagScale),
-          M_solver(M_.ParFESpace()->GetComm()),
+          fes(K_.ParFESpace()),
+          pmesh(fes->GetParMesh()),
+          nodes(nodes_),
+          mesh_fes(nodes->ParFESpace()),
+          mesh_velocity(mesh_velocity_),
+          mass_ir(mass_ir_),
           vdim(vdim_),
-          z(M_.ParFESpace()->GetTrueVSize()*vdim_)
+          X(fes),
+          z(fes->GetTrueVSize())
     {
-        M_solver.SetPreconditioner(*M_prec);
-        M_solver.iterative_mode = false;
-        M_solver.SetRelTol(1e-9);
-        M_solver.SetAbsTol(0.0);
-        M_solver.SetMaxIter(100);
-        M_solver.SetPrintLevel(0);
+        MFEM_VERIFY(fes->GetTrueVSize() == fes->GetVSize(),
+                    "DG_Evolution expects an L2 space whose true dofs coincide with its local dofs");
+        const int ne = pmesh->GetNE();
+        const int ndof = ne > 0 ? fes->GetFE(0)->GetDof() : 0;
+        for (Cache &c : cache) { c.Me_inv.SetSize(ndof, ndof, ne); }
     }
 
     void DG_Evolution::ImplicitSolve(const real_t dt, const Vector &x, Vector &k)
@@ -362,59 +363,131 @@ namespace mfem
 
     void DG_Evolution::Mult(const Vector &x, Vector &y) const
     {
-        Vector x_nodes(x.GetData(), mesh_fes->GetTrueVSize());
-        
-        nodes->SetFromTrueDofs(x_nodes);
-        pmesh->NodesUpdated();
-        
-        M_bf->Update();
-        M_bf->Assemble(0);
-        M_bf->Finalize(0);
-        
-        K_bf->Update();
-        K_bf->Assemble(0);
-        K_bf->Finalize(0);
-        
-        b_lf->Assemble();
-        
-        Vector B(M_bf->ParFESpace()->GetTrueVSize());
-        b_lf->ParallelAssemble(B);
-        
-        Array<int> ess_tdof_list;
-        OperatorPtr M, K;
-        M_bf->FormSystemMatrix(ess_tdof_list, M);
-        K_bf->FormSystemMatrix(ess_tdof_list, K);
-        
-        M_solver.SetOperator(*M);
-        
-        // y = M^{-1} (K x + b)
+        const int nmesh = mesh_fes->GetTrueVSize();
+        const int n = fes->GetTrueVSize();
+
+        Vector x_nodes(x.GetData(), nmesh);
+
+        // Look for operators built at this mesh position (equal up to
+        // rounding: nodes move linearly in pseudo-time, so stage positions
+        // either coincide or differ by O(dt |v|)). The decision is collective.
+        int hit = -1;
+        {
+            real_t loc[2] = {std::numeric_limits<real_t>::infinity(), std::numeric_limits<real_t>::infinity()};
+            for (int c = 0; c < 2; c++)
+            {
+                const Cache &C = cache[c];
+                if (!C.valid || C.nodes.Size() != nmesh) { continue; }
+                real_t diff = 0.0, scale = 0.0;
+                for (int i = 0; i < nmesh; i++)
+                {
+                    diff = fmax(diff, fabs(x_nodes(i) - C.nodes(i)));
+                    scale = fmax(scale, fabs(C.nodes(i)));
+                }
+                loc[c] = diff / fmax(scale, 1e-300);
+            }
+            real_t glob[2];
+            MPI_Allreduce(loc, glob, 2, MPITypeMap<real_t>::mpi_type, MPI_MAX, pmesh->GetComm());
+            for (int c = 0; c < 2; c++) { if (glob[c] <= 1e-12) { hit = c; break; } }
+        }
+
+        if (hit < 0)
+        {
+            nodes->SetFromTrueDofs(x_nodes);
+            pmesh->NodesUpdated();
+            Cache &C = cache[cache_lru];
+
+            // Convection matrix on the current mesh. After the first assembly
+            // the sparsity pattern is fixed, so only the values are rebuilt.
+            if (!K_allocated)
+            {
+                K_bf->Assemble(0);
+                K_bf->Finalize(0);
+                K_allocated = true;
+            }
+            else
+            {
+                // Shared faces are integrated with the neighbors' node
+                // positions, which must follow the moving mesh.
+                if (fes->GetFaceNbrVSize() > 0) { nodes->ExchangeFaceNbrData(); }
+                K_bf->SpMat() = 0.0;
+                K_bf->Assemble(0);
+            }
+            const SparseMatrix &Kasm = K_bf->SpMat();
+            // Explicit copy (assigning from an aliasing temporary would move
+            // the alias instead of copying the values).
+            const int nnz = Kasm.NumNonZeroElems();
+            C.K_values.SetSize(nnz);
+            std::copy(Kasm.GetData(), Kasm.GetData() + nnz, C.K_values.GetData());
+
+            // Element-local inverses of the block-diagonal DG mass matrix.
+            MassIntegrator mi;
+            if (mass_ir) { mi.SetIntRule(mass_ir); }
+            DenseMatrix Me;
+            for (int e = 0; e < pmesh->GetNE(); e++)
+            {
+                const FiniteElement &fe = *fes->GetFE(e);
+                ElementTransformation &Tr = *fes->GetElementTransformation(e);
+                mi.AssembleElementMatrix(fe, Tr, Me);
+                DenseMatrixInverse inv(Me);
+                inv.Factor();
+                inv.GetInverseMatrix(C.Me_inv(e));
+            }
+            C.nodes = x_nodes;
+            C.valid = true;
+            hit = cache_lru;
+        }
+        // The other slot becomes the next one to be replaced.
+        cache_lru = 1 - hit;
+        const Cache &C = cache[hit];
+        const SparseMatrix &Kpat = K_bf->SpMat();
+        // Non-owning view: cached values over the fixed sparsity pattern.
+        SparseMatrix K(const_cast<int*>(Kpat.GetI()), const_cast<int*>(Kpat.GetJ()),
+                       const_cast<real_t*>(C.K_values.GetData()),
+                       Kpat.Height(), Kpat.Width(), false, false, false);
+        const DenseTensor &Me_inv = C.Me_inv;
+
+        // y = M^{-1} K x, component by component.
+        const int nfn = fes->GetFaceNbrVSize();
+        Array<int> dofs;
+        Vector loc_z, loc_y;
         for (int d = 0; d < vdim; d++)
         {
-            Vector x_u(x.GetData() + mesh_fes->GetTrueVSize() + d*M_bf->ParFESpace()->GetTrueVSize(),
-                             M_bf->ParFESpace()->GetTrueVSize());
-            Vector y_u(y.GetData() + mesh_fes->GetTrueVSize() + d*M_bf->ParFESpace()->GetTrueVSize(),
-                             M_bf->ParFESpace()->GetTrueVSize());
-            Vector z_u(z.GetData() + d*M_bf->ParFESpace()->GetTrueVSize(),
-                             M_bf->ParFESpace()->GetTrueVSize());
-            K->Mult(x_u, z_u);
-            z_u += B;
-            M_solver.Mult(z_u, y_u); 
+            Vector x_u(x.GetData() + nmesh + d*n, n);
+            Vector y_u(y.GetData() + nmesh + d*n, n);
+            if (nfn > 0)
+            {
+                X = x_u;
+                X.ExchangeFaceNbrData();
+                x_full.SetSize(n + nfn);
+                x_full.SetVector(X, 0);
+                x_full.SetVector(X.FaceNbrData(), n);
+                K.Mult(x_full, z);
+            }
+            else
+            {
+                K.Mult(x_u, z);
+            }
+            for (int e = 0; e < pmesh->GetNE(); e++)
+            {
+                fes->GetElementDofs(e, dofs);
+                z.GetSubVector(dofs, loc_z);
+                loc_y.SetSize(loc_z.Size());
+                Me_inv(e).Mult(loc_z, loc_y);
+                y_u.SetSubVector(dofs, loc_y);
+            }
         }
-        
-        Vector y_nodes(y.GetData(), mesh_fes->GetTrueVSize());
+
+        Vector y_nodes(y.GetData(), nmesh);
         mesh_velocity->GetTrueDofs(y_nodes);
         y_nodes.Neg();
-        
     }
-    
+
     void DG_Evolution::SetTime(const real_t t)
     {
     }
 
-    DG_Evolution::~DG_Evolution()
-    {
-        delete M_prec;
-    }
+    DG_Evolution::~DG_Evolution() { }
 
     void DGRemap::Remap(ParGridFunction &mesh_velocity, ParGridFunction &u_gf)
     {
@@ -433,9 +506,6 @@ namespace mfem
         ParGridFunction *nodes = dynamic_cast<ParGridFunction *>(pmesh->GetNodes());
         ParGridFunction nodes_init(*nodes);
 
-        ParBilinearForm mass_bf(fes);
-        mass_bf.AddDomainIntegrator(new MassIntegrator);
-
         VectorGridFunctionCoefficient mesh_velocity_coeff(&mesh_velocity);
         const real_t alpha = -1.0;
         ParBilinearForm convect_bf(fes);
@@ -443,13 +513,10 @@ namespace mfem
         convect_bf.AddInteriorFaceIntegrator(
             new NonconservativeDGTraceIntegrator(mesh_velocity_coeff, alpha));
         convect_bf.AddBdrFaceIntegrator(new NonconservativeDGTraceIntegrator(mesh_velocity_coeff, alpha));
+        // The inflow boundary value is zero, so the boundary-flow linear form
+        // vanishes identically and is not assembled.
 
-        ParLinearForm b_lf(fes);
-        ConstantCoefficient zero(0.0);
-        b_lf.AddBdrFaceIntegrator(
-            new BoundaryFlowIntegrator(zero, mesh_velocity_coeff, alpha));
-
-        DG_Evolution adv(mass_bf, convect_bf, b_lf, nodes, &mesh_velocity, vdim);
+        DG_Evolution adv(convect_bf, nodes, &mesh_velocity, vdim);
 
         int ode_solver_type = 3;
         std::unique_ptr<ODESolver> ode_solver = ODESolver::Select(ode_solver_type);
@@ -458,7 +525,7 @@ namespace mfem
         real_t final_tau = 1.0;
         real_t h = GetMeshSize(fes->GetParMesh());
         real_t max_velocity = GFMaxNorm(mesh_velocity);
-        real_t dt = 0.1*h/ max_velocity / (2*fes->GetOrder(0)+1);
+        real_t dt = pseudo_cfl*h/ max_velocity / (2*fes->GetOrder(0)+1);
         int n_steps = ceil(final_tau/dt);
         dt = final_tau/n_steps;
         if (Mpi::Root())
@@ -520,6 +587,7 @@ namespace mfem
         u_l2.ProjectGridFunction(u_gf);
         
         DGRemap remap;
+        remap.SetPseudoCFL(pseudo_cfl);
         remap.Remap(mesh_velocity, u_l2);
         
         ParGridFunction *nodes = dynamic_cast<ParGridFunction *>(pmesh->GetNodes());

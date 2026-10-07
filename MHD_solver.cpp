@@ -131,7 +131,7 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
    use_viscosity(visc), use_vorticity(vort),
    cg_rel_tol(cgt), cg_max_iter(cgiter),
    gamma_gf(gamma_gf),
-   Mv(nullptr), Mv_spmat_copy(),
+   Mv(nullptr),
    Me(edofs_cnt, edofs_cnt, NE), Me_inv(edofs_cnt, edofs_cnt, NE),
    rho_gf(rho0_gf), A_gf(A_gf), B_gf(B_gf),
    fes_A(*A_gf.ParFESpace()),
@@ -231,7 +231,14 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
       break;
    }
    nodes = dynamic_cast<ParGridFunction *> (pmesh->GetNodes());
-   
+
+   // dx/dt = v is a copy when both fields live in the same H1 vector space.
+   x_v_same_space = (fes_x.GetVSize() == fes_v.GetVSize()) &&
+                    (fes_x.GetOrdering() == fes_v.GetOrdering()) &&
+                    (fes_x.GetVDim() == fes_v.GetVDim()) &&
+                    dynamic_cast<const H1_FECollection *>(fes_x.FEColl()) &&
+                    dynamic_cast<const H1_FECollection *>(fes_v.FEColl()) &&
+                    (fes_x.GetOrder(0) == fes_v.GetOrder(0));
 }
 
 LagrangianHydroOperator::~LagrangianHydroOperator()
@@ -268,8 +275,6 @@ void LagrangianHydroOperator::AssembleMvMe()
    // Standard assembly for the velocity mass matrix.
    Mv->Assemble();
    Mv->Finalize();
-   Mv_spmat_copy = Mv->SpMat();
-   
 }
 
 void LagrangianHydroOperator::Mult(const Vector &S, Vector &dS_dt) const
@@ -286,9 +291,12 @@ void LagrangianHydroOperator::Mult(const Vector &S, Vector &dS_dt) const
    // Set dx_dt = v (explicit).
    ParGridFunction dx;
    dx.MakeRef(&fes_x, dS_dt, 0);
-   dx.ProjectGridFunction(v);
+   if (x_v_same_space) { dx = v; }
+   else { dx.ProjectGridFunction(v); }
    SolveVelocity(S, dS_dt);
    SolveEnergy(S, v, dS_dt);
+   // The next Mult() call carries a different state.
+   qdata_is_current = false;
 }
 
 void LagrangianHydroOperator::SolveVelocity(const Vector &S,
@@ -316,30 +324,28 @@ void LagrangianHydroOperator::SolveVelocity(const Vector &S,
       rhs += rhs_accel_lf;
    }
    
-   ParLinearForm Lorentz_lf(&fes_v);
-   LorentzForceIntegrator *lorentz_integ = new LorentzForceIntegrator(B_gf, mu);
-   lorentz_integ->SetIntRule(&ir);
-   Lorentz_lf.AddDomainIntegrator(lorentz_integ);
-   Lorentz_lf.Assemble();
-   rhs -= Lorentz_lf;
-   
-   ParLinearForm pressure_lf(&fes_v);
-   FunctionCoefficient pressure_bdry_coeff(pd->p_bdry_func);
-   pressure_bdry_coeff.SetTime(t);
-   auto pressure_integ = new VectorBoundaryFluxLFIntegrator(pressure_bdry_coeff);
-   pressure_integ->SetIntRule(&ir);
-   if(pd->ess_bdr_p.Size() > 0)
+   if (magnetic_active)
+   {
+      // Lorentz force from the Maxwell stress sampled in UpdateQuadratureData.
+      ParLinearForm Lorentz_lf(&fes_v);
+      auto *lorentz_integ = new QuadratureForceLFIntegrator(qdata.maxwellJinvT);
+      lorentz_integ->SetIntRule(&ir);
+      Lorentz_lf.AddDomainIntegrator(lorentz_integ);
+      Lorentz_lf.Assemble();
+      rhs -= Lorentz_lf;
+   }
+
+   if (pd->ess_bdr_p.Size() > 0)
+   {
+      ParLinearForm pressure_lf(&fes_v);
+      FunctionCoefficient pressure_bdry_coeff(pd->p_bdry_func);
+      pressure_bdry_coeff.SetTime(t);
+      auto pressure_integ = new VectorBoundaryFluxLFIntegrator(pressure_bdry_coeff);
+      pressure_integ->SetIntRule(&ir);
       pressure_lf.AddBoundaryIntegrator(pressure_integ, pd->ess_bdr_p);
-   pressure_lf.Assemble();
-   rhs += pressure_lf;
-   
-   ParLinearForm magnetic_bdry_lf(&fes_v);
-   VectorGridFunctionCoefficient B_coeff(&B_gf);
-   auto magnetic_bdry_integ = new MagneticBoundaryIntegrator(B_gf, mu);
-   magnetic_bdry_integ->SetIntRule(&ir);
-   magnetic_bdry_lf.AddBdrFaceIntegrator(magnetic_bdry_integ);
-   magnetic_bdry_lf.Assemble();
-   // rhs += magnetic_bdry_lf;
+      pressure_lf.Assemble();
+      rhs += pressure_lf;
+   }
 
    HypreParMatrix A;
    Vector X(vTVSize);
@@ -449,6 +455,10 @@ double LagrangianHydroOperator::GetTimeStepEstimate(const Vector &S) const
 void LagrangianHydroOperator::ResetTimeStepEstimate() const
 {
    qdata.dt_est = std::numeric_limits<double>::infinity();
+   // Called before every step; a rejected step restores an older state, so
+   // nothing computed for the previous state may be reused.
+   qdata_is_current = false;
+   forcemat_is_assembled = false;
 }
 
 double LagrangianHydroOperator::InternalEnergy(const ParGridFunction &gf) const
@@ -496,6 +506,10 @@ MFEM_HOST_DEVICE inline double smooth_step_01(double x, double eps)
 
 void LagrangianHydroOperator::UpdateQuadratureData(const Vector &S) const
 {
+   if (qdata_is_current) { return; }
+   qdata_is_current = true;
+   forcemat_is_assembled = false;
+
    // This code is only for the 1D/FA mode
    const int nqp = ir.GetNPoints();
    ParGridFunction x, v, e;
@@ -503,8 +517,9 @@ void LagrangianHydroOperator::UpdateQuadratureData(const Vector &S) const
    x.MakeRef(&fes_x, *sptr, 0);
    v.MakeRef(&fes_v, *sptr, xVsize);
    e.MakeRef(&fes_e, *sptr, xVsize + vVsize);
-   Vector e_vals;
-   DenseMatrix Jpi(dim), sgrad_v(dim), Jinv(dim), stress(dim), stressJiT(dim);
+   Vector e_vals, rho_vals;
+   DenseMatrix Jpi(dim), sgrad_v(dim), Jinv(dim), stress(dim), stressJiT(dim),
+               maxwell(dim), maxwellJiT(dim);
 
    // Batched computations are needed, because hydrodynamic codes usually
    // involve expensive computations of material properties. Although this
@@ -517,12 +532,11 @@ void LagrangianHydroOperator::UpdateQuadratureData(const Vector &S) const
    *rho_b = new double[nqp_batch],
    *e_b   = new double[nqp_batch],
    *p_b   = new double[nqp_batch],
-   *cs_b  = new double[nqp_batch];
-   Vector *B_b = new Vector[nqp_batch];
-   for(int i = 0; i < nqp_batch; i++)
-   {
-      B_b[i].SetSize(dim);
-   }
+   *cs_b  = new double[nqp_batch],
+   *B2_b  = new double[nqp_batch];
+   // |B|^2 and the Maxwell stress need the field at every quadrature point;
+   // it is evaluated once per element and kept for the second pass.
+   DenseMatrix *B_b = magnetic_active ? new DenseMatrix[nzones_batch] : nullptr;
    // Jacobians of reference->physical transformations for all quadrature points
    // in the batch.
    DenseTensor *Jpr_b = new DenseTensor[nzones_batch];
@@ -542,7 +556,14 @@ void LagrangianHydroOperator::UpdateQuadratureData(const Vector &S) const
       {
          ElementTransformation *T = pmesh->GetElementTransformation(z_id);
          Jpr_b[z].SetSize(dim, dim, nqp);
+         // Element-wise evaluation fetches the local dofs once instead of at
+         // every quadrature point. These calls reset the shared element
+         // transformation, so they precede the loop that sets its points.
          e.GetValues(z_id, ir, e_vals);
+         rho_gf.GetValues(z_id, ir, rho_vals);
+         if (magnetic_active) { B_gf.GetVectorValues(*T, ir, B_b[z]); }
+         // Assuming piecewise constant gamma that moves with the mesh.
+         const double gamma_z = gamma_gf(z_id);
          for (int q = 0; q < nqp; q++)
          {
             const IntegrationPoint &ip = ir.IntPoint(q);
@@ -551,9 +572,8 @@ void LagrangianHydroOperator::UpdateQuadratureData(const Vector &S) const
             const double detJ = Jpr_b[z](q).Det();
             min_detJ = fmin(min_detJ, detJ);
             const int idx = z * nqp + q;
-            // Assuming piecewise constant gamma that moves with the mesh.
-            gamma_b[idx] = gamma_gf(z_id);
-            rho_b[idx] = rho_gf.GetValue(*T, ip);
+            gamma_b[idx] = gamma_z;
+            rho_b[idx] = rho_vals(q);
             // if (rho_b[idx] < 0.0)
             // {
                // real_t min_detJ, max_detJ;
@@ -576,13 +596,20 @@ void LagrangianHydroOperator::UpdateQuadratureData(const Vector &S) const
                //            << ", quadrature point " << q);
             // }
             e_b[idx] = fmax(0.0, e_vals(q));
-            B_gf.GetVectorValue(z_id, ip, B_b[idx]);
+            B2_b[idx] = 0.0;
+            if (magnetic_active)
+            {
+               for (int d = 0; d < dim; d++)
+               {
+                  B2_b[idx] += B_b[z](d, q) * B_b[z](d, q);
+               }
+            }
          }
          ++z_id;
       }
 
       // Batched computation of material properties.
-      ComputeMaterialProperties(nqp_batch, gamma_b, rho_b, e_b, B_b, p_b, cs_b);
+      ComputeMaterialProperties(nqp_batch, gamma_b, rho_b, e_b, B2_b, p_b, cs_b);
 
       z_id -= nzones_batch;
       for (int z = 0; z < nzones_batch; z++)
@@ -675,6 +702,30 @@ void LagrangianHydroOperator::UpdateQuadratureData(const Vector &S) const
                      stressJiT(vd, gd);
                }
             }
+            if (magnetic_active)
+            {
+               // Maxwell stress (B B^T - |B|^2/2 I)/mu for the Lorentz force.
+               const double B2 = B2_b[z*nqp + q];
+               for (int i = 0; i < dim; i++)
+               {
+                  const double Bi = B_b[z](i, q);
+                  for (int j = 0; j < dim; j++)
+                  {
+                     maxwell(i, j) = Bi * B_b[z](j, q);
+                  }
+                  maxwell(i, i) -= 0.5 * B2;
+               }
+               MultABt(maxwell, Jinv, maxwellJiT);
+               maxwellJiT *= ir.IntPoint(q).weight * detJ / mu;
+               for (int vd = 0 ; vd < dim; vd++)
+               {
+                  for (int gd = 0; gd < dim; gd++)
+                  {
+                     qdata.maxwellJinvT(vd)(z_id*nqp + q, gd) =
+                        maxwellJiT(vd, gd);
+                  }
+               }
+            }
          }
          ++z_id;
       }
@@ -684,12 +735,15 @@ void LagrangianHydroOperator::UpdateQuadratureData(const Vector &S) const
    delete [] e_b;
    delete [] p_b;
    delete [] cs_b;
+   delete [] B2_b;
    delete [] Jpr_b;
    delete [] B_b;
 }
 
 void LagrangianHydroOperator::AssembleForceMatrix() const
 {
+   if (forcemat_is_assembled) { return; }
+   forcemat_is_assembled = true;
    if(Force) delete Force;
    Force = new MixedBilinearForm(&fes_e, &fes_v);
    auto fi = new ForceIntegrator(qdata);
@@ -849,7 +903,10 @@ void LagrangianHydroOperator::RemeshAndRemap(Vector &S)
    GFMinMax(e_gf, e_min, e_max, &ir);
    GFMinMax(rho_gf, rho_min, rho_max, &ir);
 
-   if (preserve_mean_field)
+   qdata_is_current = false;
+   forcemat_is_assembled = false;
+
+   if (preserve_mean_field && magnetic_active)
    {
       AddUniformMeanFieldPotential(A_gf, mean_field_reference_nodes,
                                    *nodes, uniform_background);
@@ -925,6 +982,7 @@ void LagrangianHydroOperator::RemeshAndRemap(Vector &S)
    case RemapType::DGconvection:
    {
       H1DGRemap v_remap;
+      v_remap.SetPseudoCFL(remap_pseudo_cfl);
       v_remap.Remap(mesh_velocity, v_gf);
       
       // set boundary data 
@@ -961,6 +1019,7 @@ void LagrangianHydroOperator::RemeshAndRemap(Vector &S)
    case RemapType::DGconvection:
    {
       DGRemap dg_remap;
+      dg_remap.SetPseudoCFL(remap_pseudo_cfl);
       dg_remap.Remap(mesh_velocity, e_gf);
       break;
    }
@@ -984,6 +1043,8 @@ void LagrangianHydroOperator::RemeshAndRemap(Vector &S)
       printf("After remap: e min: %g, max: %g \n", e_min, e_max);
    }
    
+   if (magnetic_active)
+   {
    if(Mpi::Root())
    {
       printf("Remapping magnetic vector potential ... \n");
@@ -1019,6 +1080,7 @@ void LagrangianHydroOperator::RemeshAndRemap(Vector &S)
       MFEM_VERIFY(dim==3, "Helicity preserving remap is only implemented for 3D.");
       HPRemap remap_A(*pmesh, &fes_A, &fes_B, mu, &H_bdry_coeff, ess_bdr_H);
       remap_A.SetEssentialA(mesh_smooth_type!=MeshSmoothType::INITIAL);
+      remap_A.SetPseudoCFL(remap_pseudo_cfl);
       remap_A.Remap(mesh_velocity, A_gf);
       break;
    }
@@ -1026,6 +1088,7 @@ void LagrangianHydroOperator::RemeshAndRemap(Vector &S)
    {
       MFEM_VERIFY(dim==2, "DG convection remap is only implemented for 2D.");
       H1DGRemap remap_A;
+      remap_A.SetPseudoCFL(remap_pseudo_cfl);
       remap_A.Remap(mesh_velocity, A_gf);
       break;
    }
@@ -1033,6 +1096,7 @@ void LagrangianHydroOperator::RemeshAndRemap(Vector &S)
       mfem_error("Unknown remap type for magnetic vector potential.");
       break;
    }
+   } // magnetic_active
 
    // todo: gamma remap? check the use of gamma in the whole code.
    
@@ -1041,16 +1105,18 @@ void LagrangianHydroOperator::RemeshAndRemap(Vector &S)
    UpdateMesh(S);
    
    // update B
-   ComputeCurl(A_gf, B_gf);
-   if(pd->periodic)
+   if (magnetic_active)
    {
-      ParGridFunction B0_gf(&fes_B);
-      B0_gf = 0.0;
-      DivFreeProject(B0_gf, &fes_divB, *pd->B0_periodic);
-      B_gf += B0_gf;
+      ComputeCurl(A_gf, B_gf);
+      if(pd->periodic)
+      {
+         ParGridFunction B0_gf(&fes_B);
+         B0_gf = 0.0;
+         DivFreeProject(B0_gf, &fes_divB, *pd->B0_periodic);
+         B_gf += B0_gf;
+      }
+      if (preserve_mean_field) { mean_field_reference_nodes = *nodes; }
    }
-   
-   if (preserve_mean_field) { mean_field_reference_nodes = *nodes; }
 
    // restart Lagrangian 
    AssembleMvMe();

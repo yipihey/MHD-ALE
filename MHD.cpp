@@ -165,6 +165,9 @@ int main(int argc, char *argv[])
    bool preserve_mean_field = false;
    bool comoving_rezone = false;
    bool magnetic_audit_enabled = false;
+   bool hydro_only = false;
+   int diag_interval = 1;
+   real_t remap_pseudo_cfl = 0.1;
    bool shear_periodic_x = false;
    real_t shear_boost_x = 0.0;
    const char *box_ic_file = "box.ic";
@@ -245,6 +248,15 @@ int main(int argc, char *argv[])
    args.AddOption(&comoving_rezone, "-crz", "--comoving-rezone",
                   "-no-crz", "--no-comoving-rezone",
                   "Retain bulk translation in periodic initial-mesh rezoning.");
+   args.AddOption(&hydro_only, "-hydro", "--hydro-only", "-mhd", "--mhd",
+                  "Pure hydrodynamics: skip all magnetic terms (also enabled "
+                  "automatically when the initial B vanishes identically).");
+   args.AddOption(&remap_pseudo_cfl, "-rcfl", "--remap-cfl",
+                  "Pseudo-time CFL safety factor of the advection remaps "
+                  "(dt = rcfl*h/max|v|/(2p+1)).");
+   args.AddOption(&diag_interval, "-di", "--diag-interval",
+                  "Evaluate per-step diagnostics (errors, div B, rho min, helicity) "
+                  "every N accepted steps (always at the last step).");
    args.AddOption(&magnetic_audit_enabled, "-ma", "--magnetic-audit",
                   "-no-ma", "--no-magnetic-audit",
                   "Record native magnetic energy and mean flux around remaps.");
@@ -560,6 +572,21 @@ int main(int argc, char *argv[])
       B_gf += B0_gf;
    }
    
+   if (!hydro_only && !pd->periodic)
+   {
+      // An identically vanishing field stays zero (A is frozen into the
+      // Lagrangian mesh), so the magnetic terms can be skipped.
+      real_t bmax_loc = B_gf.Normlinf(), bmax;
+      MPI_Allreduce(&bmax_loc, &bmax, 1, MPITypeMap<real_t>::mpi_type, MPI_MAX, pmesh->GetComm());
+      if (bmax == 0.0)
+      {
+         hydro_only = true;
+         if (Mpi::Root()) { cout << "Initial B vanishes: running in hydro-only mode." << endl; }
+      }
+   }
+   MFEM_VERIFY(!(hydro_only && pd->periodic && pd->B0_periodic),
+               "Hydro-only mode is incompatible with a periodic background field.");
+
    VectorFunctionCoefficient H_bdry_coeff(dim, pd->H_bdry_func);
 
    // Piecewise constant ideal gas coefficient over the Lagrangian mesh. The
@@ -587,6 +614,7 @@ int main(int argc, char *argv[])
                                                 A_gf, B_gf, divB_FESpace,
                                                 pd->mu, H_bdry_coeff, pd->ess_bdr_H, mesh_smooth_type, smooth_eps, pd, fix_step_remesh, fix_step_remesh_interval);
                                                 
+   hydro.SetMagneticActive(!hydro_only);
    hydro.SetVelocityBoundaryValue(v_gf);
                            
    hydro.SetRemeshParameters(min_detJ, max_detJ, max_ratio, max_displacement);
@@ -597,6 +625,7 @@ int main(int argc, char *argv[])
    hydro.SetRemapType_e(remap_type_e);
    hydro.SetRemapType_A(remap_type_A);
    hydro.SetRemapType_rho(remap_type_rho, bp_type);
+   hydro.SetRemapPseudoCFL(remap_pseudo_cfl);
 
    socketstream vis_rho, vis_v, vis_e, vis_B, vis_A;
    char vishost[] = "localhost";
@@ -629,7 +658,7 @@ int main(int argc, char *argv[])
    sprintf(B_div_err_file, "%s/B_divergence_error.dat", outputdir);
    std::ofstream B_div_err_out;
    if (Mpi::Root()) { B_div_err_out.open(B_div_err_file); }
-   real_t B_err = GFDivError(B_gf);
+   real_t B_err = hydro_only ? 0.0 : GFDivError(B_gf);
    B_div_err_out << std::scientific << std::setprecision(16)
                      << t << " " << B_err << endl;
                      
@@ -649,7 +678,7 @@ int main(int argc, char *argv[])
    std::ofstream helicity_out;
    if (Mpi::Root()) { helicity_out.open(helicity_file); }
    real_t helicity = 0.0;
-   if(dim == 3) helicity = GFInnerProduct(B_gf, A_gf);
+   if(dim == 3 && !hydro_only) helicity = GFInnerProduct(B_gf, A_gf);
    helicity_out << std::scientific << std::setprecision(16)
                  << t << " " << helicity << endl;
                  
@@ -772,7 +801,9 @@ int main(int argc, char *argv[])
          cout << std::fixed;
          cout << endl;
       }
-      PrintError(pd, t, rho_gf, v_gf, e_gf, B_gf);
+      const bool diag_now = last_step || (diag_interval <= 1) ||
+                            (steps % diag_interval == 0);
+      if (diag_now) { PrintError(pd, t, rho_gf, v_gf, e_gf, B_gf); }
       
       // ALE remap
       bool need_remesh = false;
@@ -795,25 +826,28 @@ int main(int argc, char *argv[])
                Visualization(visualization, paraview, pmesh, rho_gf, v_gf, e_gf, B_gf, A_gf, ++ti, t+100,
                              outputdir, paraview_basename);
             }
-            PrintError(pd, t, rho_gf, v_gf, e_gf, B_gf);
+            if (diag_now) { PrintError(pd, t, rho_gf, v_gf, e_gf, B_gf); }
          }
       } 
       ale_out << std::scientific << std::setprecision(16)
                 << t << " " << need_remesh << endl;
       
       audit_magnetic(t, "accepted_step");
-      // output divergence error of B
-      B_err = GFDivError(B_gf);
-      B_div_err_out << std::scientific << std::setprecision(16)
-                     << t << " " << B_err << endl;
-                     
-      GFMinMax(rho_gf, rho_min, rho_max, &hydro.GetIntegrationRule());
-      rho_min_out << std::scientific << std::setprecision(16)
-                   << t << " " << rho_min << endl;
-                   
-      if(dim==3) helicity = GFInnerProduct(B_gf, A_gf);
-      helicity_out << std::scientific << std::setprecision(16)
-                    << t << " " << helicity << endl;
+      if (diag_now)
+      {
+         // output divergence error of B
+         B_err = hydro_only ? 0.0 : GFDivError(B_gf);
+         B_div_err_out << std::scientific << std::setprecision(16)
+                        << t << " " << B_err << endl;
+
+         GFMinMax(rho_gf, rho_min, rho_max, &hydro.GetIntegrationRule());
+         rho_min_out << std::scientific << std::setprecision(16)
+                      << t << " " << rho_min << endl;
+
+         if(dim==3 && !hydro_only) helicity = GFInnerProduct(B_gf, A_gf);
+         helicity_out << std::scientific << std::setprecision(16)
+                       << t << " " << helicity << endl;
+      }
 
       if (last_step || CheckPlot(plot_time, t))
       {

@@ -11,9 +11,14 @@ namespace mfem
    class Remapping
    {
    protected:
+      // Pseudo-time step safety factor for the advection-based remaps:
+      // dt = pseudo_cfl * h / max|v_mesh| / (2p+1).
+      real_t pseudo_cfl = 0.1;
    public:
       Remapping() {}
       virtual ~Remapping() {}
+
+      void SetPseudoCFL(real_t c) { pseudo_cfl = c; }
 
       virtual void Remap(ParGridFunction &mesh_velocity, ParGridFunction &gf) = 0;
    };
@@ -132,23 +137,44 @@ namespace mfem
       void SetEssentialA(bool ess_A_) { ess_A = ess_A_; };
    };
 
+   /* Pseudo-time evolution dU/dtau = M^{-1} K U on the moving mesh, for a
+      scalar L2 (DG) space applied component-wise. The DG mass matrix is block
+      diagonal, so it is inverted element by element; the convection matrix
+      keeps its sparsity pattern and only its values are reassembled, and its
+      action uses the local sparse matrix with face-neighbor data instead of a
+      parallel (hypre) matrix. */
    class DG_Evolution : public TimeDependentOperator
    {
    private:
-      ParBilinearForm *M_bf, *K_bf;
-      ParLinearForm *b_lf;
+      ParBilinearForm *K_bf;
+      ParFiniteElementSpace *fes;
       ParMesh *pmesh;
       ParGridFunction *nodes;
       ParFiniteElementSpace *mesh_fes;
       ParGridFunction *mesh_velocity;
-      mutable Solver *M_prec;
-      mutable CGSolver M_solver;
+      const IntegrationRule *mass_ir;
 
       int vdim;
-      mutable Vector z;
+      mutable bool K_allocated = false;
+      // Operators keyed by mesh position. RK3-SSP evaluates at tau, tau+dt
+      // and tau+dt/2; the tau+dt stage coincides with the next step's first
+      // stage, so with two slots one assembly in three is skipped.
+      struct Cache
+      {
+         bool valid = false;
+         Vector nodes;     // mesh true dofs the operators were built for
+         Vector K_values;  // values of the convection matrix (fixed pattern)
+         DenseTensor Me_inv;
+      };
+      mutable Cache cache[2];
+      mutable int cache_lru = 0;
+      mutable ParGridFunction X;
+      mutable Vector x_full, z;
 
    public:
-      DG_Evolution(ParBilinearForm &M_, ParBilinearForm &K_, ParLinearForm &b_, ParGridFunction *nodes_, ParGridFunction *mesh_velocity_, int vdim_);
+      DG_Evolution(ParBilinearForm &K_, ParGridFunction *nodes_,
+                   ParGridFunction *mesh_velocity_, int vdim_,
+                   const IntegrationRule *mass_ir_ = nullptr);
 
       void Mult(const Vector &x, Vector &y) const override;
       void ImplicitSolve(const real_t dt, const Vector &x, Vector &k) override;

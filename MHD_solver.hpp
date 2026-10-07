@@ -75,7 +75,6 @@ protected:
    // Velocity mass matrix and local inverses of the energy mass matrices. These
    // are constant in time, due to the pointwise mass conservation property.
    mutable ParBilinearForm *Mv;
-   SparseMatrix Mv_spmat_copy;
    DenseTensor Me, Me_inv;
    
    ParGridFunction &rho_gf;
@@ -97,6 +96,17 @@ protected:
    // Data associated with each quadrature point in the mesh.
    // These values are recomputed at each time step.
    mutable QuadratureData qdata;
+   // The quadrature data and the force matrix depend only on the state S of
+   // the current Mult() call; both are reused by the velocity and energy
+   // solves of that call instead of being recomputed.
+   mutable bool qdata_is_current = false;
+   mutable bool forcemat_is_assembled = false;
+   // False for pure hydrodynamics (B == 0): all magnetic evaluations, the
+   // Lorentz force and the magnetic remap are skipped.
+   bool magnetic_active = true;
+   // True when the position and velocity spaces coincide, so dx/dt = v is a
+   // plain copy instead of a projection.
+   bool x_v_same_space = false;
    // Force matrix that combines the kinematic and thermodynamic spaces. It is
    // assembled in each time step and then it is used to compute the final
    // right-hand sides for momentum and specific internal energy.
@@ -125,16 +135,19 @@ protected:
    RemapType remap_type_A;
    RemapType remap_type_rho;
    BoundPreservingType bp_type;
+   real_t remap_pseudo_cfl = 0.1;
 
+   // B2[v] holds |B|^2 at the point (ignored when magnetic_active is false).
    virtual void ComputeMaterialProperties(int nvalues, const double gamma[],
-                                          const double rho[], const double e[], const Vector B[],
+                                          const double rho[], const double e[], const double B2[],
                                           double p[], double cs[]) const
    {
       for (int v = 0; v < nvalues; v++)
       {
          p[v]  = (gamma[v] - 1.0) * rho[v] * e[v];
-         cs[v] = sqrt(gamma[v] * (gamma[v]-1.0) * e[v] + B[v].Norml2()/sqrt(mu*rho[v]));
-         ;
+         double cs2 = gamma[v] * (gamma[v]-1.0) * e[v];
+         if (magnetic_active) { cs2 += sqrt(B2[v])/sqrt(mu*rho[v]); }
+         cs[v] = sqrt(cs2);
       }
    }
 
@@ -194,6 +207,8 @@ public:
    bool NeedRemesh();
    void RemeshAndRemap(Vector &S);
    void SetPreserveMeanField(bool enabled);
+   void SetMagneticActive(bool enabled) { magnetic_active = enabled; }
+   bool MagneticActive() const { return magnetic_active; }
    void SetComovingRezone(bool enabled);
    void SetRemeshParameters(real_t min_detJ_, real_t max_detJ_, real_t max_ratio_, real_t max_disp_)
    { min_detJ = min_detJ_; max_detJ = max_detJ_; max_ratio = max_ratio_; max_disp = max_disp_; }
@@ -201,6 +216,7 @@ public:
    void SetRemapType_e(RemapType rt){ remap_type_e = rt; }
    void SetRemapType_A(RemapType rt){ remap_type_A = rt; }
    void SetRemapType_rho(RemapType rt, BoundPreservingType bp){ remap_type_rho = rt; bp_type = bp; }
+   void SetRemapPseudoCFL(real_t c) { remap_pseudo_cfl = c; }
    
    const IntegrationRule & GetIntegrationRule() {return ir;}
 };

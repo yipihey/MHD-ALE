@@ -24,6 +24,11 @@ struct QuadratureData
    // It must be recomputed in every time step.
    DenseTensor stressJinvT;
 
+   // Same combination for the Maxwell stress (B_i B_j - B^2/2 delta_ij)/mu.
+   // It enters only the momentum equation, so it is kept apart from the
+   // hydrodynamic stress that also drives the internal energy equation.
+   DenseTensor maxwellJinvT;
+
    // Initial length scale. This represents a notion of local mesh size.
    // We assume that all initial zones have similar size.
    double h0;
@@ -34,7 +39,8 @@ struct QuadratureData
 
    QuadratureData(int dim, int NE, int quads_per_el)
       : Jac0inv(dim, dim, NE * quads_per_el),
-        stressJinvT(NE * quads_per_el, dim, dim) { }
+        stressJinvT(NE * quads_per_el, dim, dim),
+        maxwellJinvT(NE * quads_per_el, dim, dim) { }
 };
 
 
@@ -55,6 +61,26 @@ public:
 
    /** Given a particular Finite Element and a transformation (Tr)
        computes the element right hand side element vector, elvect. */
+   virtual void AssembleRHSElementVect(const FiniteElement &el,
+                                       ElementTransformation &Tr,
+                                       Vector &elvect) override;
+
+   using LinearFormIntegrator::AssembleRHSElementVect;
+};
+
+// Linear form \int (sigma : grad w) dx for a vector test function w, where
+// sigma*Jinv^T*weight*detJ is taken from a precomputed quadrature tensor
+// (e.g. QuadratureData::maxwellJinvT). Only reference gradients are needed.
+class QuadratureForceLFIntegrator : public LinearFormIntegrator
+{
+private:
+   const DenseTensor &JinvT;
+   DenseMatrix dshape;
+
+public:
+   QuadratureForceLFIntegrator(const DenseTensor &JinvT_)
+      : LinearFormIntegrator(), JinvT(JinvT_) { }
+
    virtual void AssembleRHSElementVect(const FiniteElement &el,
                                        ElementTransformation &Tr,
                                        Vector &elvect) override;

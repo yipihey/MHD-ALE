@@ -67,6 +67,33 @@ mpirun -np 1 ./MHD -p 14 -dim 2 -m mesh/Disk-4x4-quad.mesh \
 Diagnostic files are opened only by MPI rank zero. The Fourier file format
 and a 3-D example are documented in the remapping note.
 
+## Performance notes
+
+Profiling the Taylor-Green ALE runs showed that the pseudo-time DG advection
+remaps dominate the wall time, not the Lagrangian stages. The remap operator
+now inverts the block-diagonal DG mass matrix element by element, reuses the
+convection matrix's sparsity pattern, applies it through the local sparse
+matrix with face-neighbor data instead of forming a parallel matrix, and
+reuses the operators of the RK3-SSP stage that coincides with the next step's
+first stage. The Lagrangian stages compute the quadrature data and force
+matrix once per `Mult()`, evaluate the fields element-wise, and take the
+Lorentz force from the Maxwell stress sampled in that same pass.
+
+New options:
+
+| Option | Effect |
+| --- | --- |
+| `-hydro` / `--hydro-only` | Skip all magnetic terms (Lorentz force, Alfven speed, magnetic remap, `div B` and helicity diagnostics). Enabled automatically when the initial `B` vanishes identically on a non-periodic problem. |
+| `-di N` / `--diag-interval N` | Evaluate the per-step error, `div B`, `rho_min` and helicity diagnostics every `N` accepted steps (default 1; always at the last step). |
+| `-rcfl C` / `--remap-cfl C` | Pseudo-time CFL safety factor of the advection remaps, `dt = C h / max|v| / (2p+1)` (default 0.1, the previous hard-coded value). |
+
+The DG remap previously solved its mass systems with CG to a relative
+tolerance of 1e-9; the exact local inverse changes results at that level, so
+bitwise comparisons against binaries built before this change differ at
+~1e-11 in the reported errors. Multi-rank runs additionally refresh the
+face-neighbor node positions during the pseudo-time advection, which the
+previous implementation left at their initial values.
+
 ## Regression checks
 
 Python 3 is needed for the test driver; it uses only the standard library.
