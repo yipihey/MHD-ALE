@@ -194,7 +194,10 @@ def main():
             check("long: retained magnetic growth",abs(corrected["energy_ratio"]-reference["energy_ratio"]),1e-5)
             checks.append(dict(name="long: order-unity growth",passed=corrected["energy_ratio"]>2.0))
             torus = shear("long-torus-xboost10",ref=2,px=True,ux=10,final=.5,interval=10)
-            check("long: x-periodic boosted growth",abs(torus["energy_ratio"]-reference["energy_ratio"]),1e-5)
+            torus_reference = shear("long-torus-lagrangian",ref=2,mode="lagrangian",
+                                    px=True,ux=10,final=.5,interval=10)
+            check("long: x-periodic boosted growth",
+                  abs(torus["energy_ratio"]-torus_reference["energy_ratio"]),1e-5)
     except BaseException as error:
         checks.append(dict(name="suite completion",passed=False,error=str(error)))
         raise

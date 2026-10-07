@@ -87,3 +87,6 @@ errors with an unmodified upstream binary.
 Each run creates a new directory under `tests/output/` containing commands,
 native diagnostics, logs, binary hashes and `summary.json`. These generated
 files and binaries are ignored by git.
+
+The [recorded validation results](docs/validation.md) include the long growth
+control and the comparison with the unmodified Taylor-Green executable.
