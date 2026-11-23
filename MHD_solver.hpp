@@ -146,7 +146,7 @@ protected:
       {
          p[v]  = (gamma[v] - 1.0) * rho[v] * e[v];
          double cs2 = gamma[v] * (gamma[v]-1.0) * e[v];
-         if (magnetic_active) { cs2 += sqrt(B2[v])/sqrt(mu*rho[v]); }
+         if (magnetic_active) { cs2 += B2[v]/(mu*rho[v]); } // fast speed: cs^2 + vA^2
          cs[v] = sqrt(cs2);
       }
    }

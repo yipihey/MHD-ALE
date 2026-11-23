@@ -467,7 +467,11 @@ namespace mfem
         // retain it rather than invoking a singular mixed-system solve.
         gf.ProjectCoefficient(fcoeff);
         const real_t norm = sqrt(GFInnerProduct(gf,gf));
-        if(GFDivError(gf) <= 1e-11*std::max(norm,real_t(1e-30))) return;
+        // div B is B over a length, so compare it with norm/h. The divergence of an exactly represented field is
+        // round-off that grows as the mesh is refined: against norm alone it exceeds 1e-11 from 128^2 elements of the
+        // unit square on, and the mixed solve below does not converge on a fully periodic mesh.
+        const real_t h = GetMeshSize(gf.ParFESpace()->GetParMesh());
+        if(GFDivError(gf) <= 1e-11*std::max(norm,real_t(1e-30))/h) return;
 
         ParFiniteElementSpace *R_space = gf.ParFESpace();
         StopWatch chrono;
